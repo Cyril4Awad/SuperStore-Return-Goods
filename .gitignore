@@ -1,0 +1,11 @@
+# Visual Studio
+.vs/
+*.user
+*.suo
+
+# Web service build output
+StockSearch_WS/bin/
+StockSearch_WS/obj/
+
+# Node packages (npm install restores them)
+node_modules/

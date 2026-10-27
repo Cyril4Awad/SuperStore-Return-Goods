@@ -1,0 +1,1 @@
+﻿<%@ ServiceHost Language="VB" Debug="true" Service="SuperStoreReturnGoods_WS.DataService" CodeBehind="DataService.svc.vb" %>
