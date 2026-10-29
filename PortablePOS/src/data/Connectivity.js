@@ -2,6 +2,7 @@ import NetInfo from '@react-native-community/netinfo';
 import { callService } from './ServiceCall';
 
 let cachedOnline = false;
+let cachedNetworkUp = true;
 let lastCheckMs = 0;
 const CHECK_INTERVAL_MS = 15000;
 // The checks run one after the other : an old answer never replaces a newer one
@@ -10,6 +11,12 @@ let checkSequence = 0;
 export const pingServer = () => callService('Ping', {}, 8000)
     .then(result => result === 'Success' || result === '"Success"')
     .catch(() => false);
+
+// The test of the server form : resolves when the server answers the ping, else rejects with the reason
+export const testServer = (server) => callService('Ping', {}, 8000, server)
+    .then(result => {
+        if (result !== 'Success' && result !== '"Success"') throw new Error(`The Server ${server} Sent An Invalid Answer.`);
+    });
 
 // Online : the server answers. The Wi-Fi of the store has no internet, so only the connection to the network counts
 // (isInternetReachable would be false there), then the ping says if the server can be reached
@@ -20,6 +27,7 @@ export const refreshConnectivity = async () => {
     const serverUp = networkUp ? await pingServer() : false;
     if (sequence === checkSequence) {
         cachedOnline = serverUp;
+        cachedNetworkUp = networkUp;
         lastCheckMs = Date.now();
     }
     return { isOnline: serverUp, networkUp, serverUp, isLatest: sequence === checkSequence };
@@ -27,7 +35,7 @@ export const refreshConnectivity = async () => {
 
 export const getConnectivity = async (force = false) => {
     if (!force && Date.now() - lastCheckMs < CHECK_INTERVAL_MS) {
-        return { isOnline: cachedOnline, networkUp: cachedOnline, serverUp: cachedOnline };
+        return { isOnline: cachedOnline, networkUp: cachedNetworkUp, serverUp: cachedOnline };
     }
     return refreshConnectivity();
 };

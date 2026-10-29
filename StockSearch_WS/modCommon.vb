@@ -20,9 +20,28 @@ Module modCommon
         End Get
     End Property
 
+    'MultiUnit 1 : the database has the units of the items (tbl_StockUnit, Sr_StkUnit, BSy_UnitCode)
+    '          0 : the older databases, the item has its one unit (Stk_UnitCode), the unit of a return is the unit of its item
+    'Not in the Web.config : 1
+    Public ReadOnly Property AppMultiUnit As Boolean
+        Get
+            Return If(ConfigurationManager.AppSettings("MultiUnit"), "1").Trim() <> "0"
+        End Get
+    End Property
+
     Public ReadOnly Property AppUserCode As String
         Get
             Return If(ConfigurationManager.AppSettings("UserCode"), "").Trim()
+        End Get
+    End Property
+
+    'The user of the call : the device name (Settings of the device), sent first in the token header (device name|device id_unique id),
+    'else the UserCode of the Web.config
+    Public ReadOnly Property RequestUserCode As String
+        Get
+            Dim token = If(System.ServiceModel.Web.WebOperationContext.Current?.IncomingRequest.Headers("token"), "")
+            Dim deviceName = token.Split("|"c)(0).Trim()
+            Return If(deviceName <> "", deviceName, AppUserCode)
         End Get
     End Property
 

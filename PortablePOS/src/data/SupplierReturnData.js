@@ -3,24 +3,63 @@ import DeviceInfo from 'react-native-device-info';
 import { callService } from './ServiceCall';
 import { getConnectivity, pingServer } from './Connectivity';
 import OfflineStore from './OfflineStore';
+import ServerInfo from '../configuration/ServerInfo';
 
 const draftStorageKey = '@superStoreReturnGoods_draft';
 
 const parse = (result) => result === '' ? [] : JSON.parse(result);
 
-const useOfflineData = async () => {
-    if (!(await OfflineStore.hasCatalog())) return false;
-    const { serverUp } = await getConnectivity(true);
-    return !serverUp;
+// The Wi-Fi is on but the server does not answer : the server may be wrong, so the downloaded data is used
+// only once the user chooses Work Offline (until the server answers again). Without Wi-Fi it is used directly
+let workOfflineChosen = false;
+
+const SetWorkOffline = (value) => {
+    workOfflineChosen = value;
 };
 
+// The downloaded data is the data of the saved server (a download made before the server was kept : unknown, accepted)
+const IsCatalogOfServer = async () => {
+    const [catalogServer, server] = await Promise.all([OfflineStore.getCatalogServer(), ServerInfo.getServer()]);
+    return !catalogServer || catalogServer.toLowerCase() === server.toLowerCase();
+};
+
+// connectivity : { serverUp, networkUp } (Connectivity), returns it with
+// { hasCatalog, catalogOfServer, useOffline } useOffline : the downloaded data is used instead of the server
+const OfflineStatusOf = async ({ serverUp, networkUp }) => {
+    if (serverUp) workOfflineChosen = false;
+    const hasCatalog = await OfflineStore.hasCatalog();
+    const catalogOfServer = hasCatalog && (await IsCatalogOfServer());
+    return {
+        serverUp,
+        networkUp,
+        hasCatalog,
+        catalogOfServer,
+        useOffline: !serverUp && catalogOfServer && (!networkUp || workOfflineChosen),
+    };
+};
+
+const GetOfflineStatus = async () => OfflineStatusOf(await getConnectivity(true));
+
+// Why the app cannot work : no server and the downloaded data cannot be used
+const OfflineMessage = ({ networkUp, hasCatalog, catalogOfServer }) =>
+    !hasCatalog ? `${networkUp ? 'Cannot Connect To The Server' : 'No Wi-Fi'}.\nDownload Suppliers And Stock While Online To Work Offline.` :
+        !catalogOfServer ? 'Cannot Connect To The Server.\nThe Downloaded Data Is From Another Server.' :
+            'Cannot Connect To The Server.\nCheck The Server, Or Choose Work Offline.';
+
+const useOfflineData = async () => (await GetOfflineStatus()).useOffline;
+
 const offlineRequired = async () => {
-    if (await useOfflineData()) return true;
-    const { isOnline } = await getConnectivity(true);
-    if (!isOnline) {
-        throw new Error('You Are Offline.\nDownload Suppliers And Stock While Online To Work Offline.');
-    }
+    const status = await GetOfflineStatus();
+    if (status.useOffline) return true;
+    if (!status.serverUp) throw new Error(OfflineMessage(status));
     return false;
+};
+
+// Returns saved on the device go only to the server of their data
+const CheckCatalogServer = async (action) => {
+    if (await IsCatalogOfServer()) return;
+    const catalogServer = await OfflineStore.getCatalogServer();
+    throw new Error(`The Returns Saved On The Device Were Made With The Data Of The Server ${catalogServer}.\n${action}`);
 };
 
 const GetReturnSetup = async () => {
@@ -30,10 +69,14 @@ const GetReturnSetup = async () => {
         return setup;
     }
     try {
-        return await callService('GetReturnSetup', {}).then(parse);
+        // A short wait : a wrong server is shown quickly, so it can be changed
+        return await callService('GetReturnSetup', {}, 10000).then(parse);
     } catch (error) {
-        const setup = await OfflineStore.getCachedSetup();
-        if (setup) return setup;
+        // The setup of the downloaded data is shown only when that data can be used
+        if ((await GetOfflineStatus()).useOffline) {
+            const setup = await OfflineStore.getCachedSetup();
+            if (setup) return setup;
+        }
         throw error;
     }
 };
@@ -137,13 +180,16 @@ const SaveSupplierReturns = async (supplierCode, saveMode, lines, options = {}) 
 
     let onDevice = pendingId !== null;
     if (!onDevice) {
-        const { serverUp } = await getConnectivity(true);
-        if (!serverUp) {
+        const status = await GetOfflineStatus();
+        if (!status.serverUp) {
             if (saveMode !== 'A') {
                 throw new Error('Cannot Reach The Server.\nThese Returns Are On The Server, Save Them When You Are Online.');
             }
-            if (!(await OfflineStore.hasCatalog())) {
-                throw new Error('You Are Offline.\nDownload Suppliers And Stock While Online To Work Offline.');
+            if (!status.useOffline) {
+                const error = new Error(OfflineMessage(status));
+                // The Wi-Fi is on : the user can still choose to save on the device
+                error.canWorkOffline = status.catalogOfServer;
+                throw error;
             }
             onDevice = true;
         }
@@ -239,6 +285,12 @@ const DownloadOfflineCatalog = async (onProgress, token = null) => {
     const online = await pingServer();
     if (!online) throw new Error('Cannot Reach The Server.\nConnect To Wi-Fi To Download Offline Data.');
 
+    // A download from another server would make the returns saved on the device go to that server
+    if ((await OfflineStore.countPendingReturns()) > 0) {
+        await CheckCatalogServer('Upload Them To That Server Before Downloading From This One.');
+    }
+    const server = await ServerInfo.getServer();
+
     const bars = {
         suppliers: { title: 'Suppliers', current: 0, total: 0 },
         items: { title: 'Items', current: 0, total: 0 },
@@ -309,7 +361,7 @@ const DownloadOfflineCatalog = async (onProgress, token = null) => {
         await untilCancelled(token, Promise.resolve());
         token?.lock();
         report('Saving On The Device', false);
-        await OfflineStore.finishCatalogDownload({ setup, suppliers, productGroups: counts.productGroups ?? [] });
+        await OfflineStore.finishCatalogDownload({ setup, suppliers, productGroups: counts.productGroups ?? [], server });
     } catch (error) {
         await OfflineStore.discardCatalogDownload().catch(() => { });
         throw error;
@@ -332,6 +384,7 @@ const DownloadOfflineCatalog = async (onProgress, token = null) => {
 const UploadAllPendingReturns = async (onProgress, token = null) => {
     const online = await pingServer();
     if (!online) throw new Error('Cannot Reach The Server.\nConnect To Wi-Fi To Upload.');
+    await CheckCatalogServer('Change The Server Back To That Server To Upload Them.');
 
     const pending = (await OfflineStore.getPendingReturns()).sort((left, right) => left.id - right.id);
     if (pending.length === 0) throw new Error('No Saved Returns To Upload.');
@@ -406,4 +459,8 @@ export default {
     ReadDraft,
     ClearDraft,
     pingServer,
+    SetWorkOffline,
+    OfflineStatusOf,
+    GetOfflineStatus,
+    OfflineMessage,
 };

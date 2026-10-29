@@ -1,5 +1,6 @@
 import React, { useState, useEffect, useRef } from 'react';
 import { View, Text, TextInput, StyleSheet, TouchableOpacity, Pressable, Keyboard, Image, FlatList, BackHandler, Modal } from 'react-native';
+import DeviceInfo from 'react-native-device-info';
 import Colors from '../variables/Colors';
 import Sizing from '../variables/Sizing';
 import { FontSize } from '../variables/ResponsiveFont';
@@ -12,7 +13,7 @@ import StockSearch from '../components/lists/supplierReturn/StockSearch';
 import ReturnLineEditor from '../components/lists/supplierReturn/ReturnLineEditor';
 import SupplierReturnData from '../data/SupplierReturnData';
 import OfflineStore from '../data/OfflineStore';
-import { subscribeConnectivity, getConnectivity } from '../data/Connectivity';
+import { subscribeConnectivity, testServer } from '../data/Connectivity';
 import ServerInfo from '../configuration/ServerInfo';
 import { setServiceLocation } from '../data/ServiceCall';
 import ModalTitle from '../components/ModalTitle';
@@ -48,10 +49,14 @@ const newLineKey = () => String(++lineKey);
 const SupplierReturnScreen = () => {
 
   // { warehouses: [{ code, description }], defaultWarehouse, qtyDecimals, location, userCode }
+  // The user shown is the device name (Settings of the device), the server saves it as the user code
   const [setup, setSetup] = useState(null);
 
   const [serverModalVisible, setServerModalVisible] = useState(false);
   const [serverDraft, setServerDraft] = useState('');
+  // The test of the server typed : { status: '' | 'testing' | 'ok' | 'failed', message }, Save only after it passed
+  const [serverTest, setServerTest] = useState({ status: '', message: '' });
+  const serverDraftRef = useRef('');
   const infoTapCount = useRef(0);
   const infoTapTimer = useRef(null);
 
@@ -85,7 +90,11 @@ const SupplierReturnScreen = () => {
   const noticeTimer = useRef(null);
 
   const [isOnline, setIsOnline] = useState(false);
+  // The Wi-Fi is connected (the server may still not answer)
+  const [networkUp, setNetworkUp] = useState(true);
   const [hasOfflineCatalog, setHasOfflineCatalog] = useState(false);
+  // The downloaded data (of the saved server) is used now (SupplierReturnData.OfflineStatusOf)
+  const [useOffline, setUseOffline] = useState(false);
   const [pendingCount, setPendingCount] = useState(0);
   const [pendingRecordCount, setPendingRecordCount] = useState(0);
   const [lastDownloadAt, setLastDownloadAt] = useState('');
@@ -98,9 +107,12 @@ const SupplierReturnScreen = () => {
   // The draft is saved after the one of the last time was restored or discarded only
   const draftReady = useRef(false);
 
+  // Without the units (multiUnit false, the database has no units) the unit is not shown
+  const multiUnit = setup?.multiUnit !== false;
+  const unitText = (unit) => multiUnit && unit ? unit : '';
   const activeLines = lines.filter(line => line.state !== 'D');
   const shownLines = FilterRows(activeLines, linesFilter,
-    line => `${line.itemReference} ${line.barcode} ${line.description} ${line.unit} ${line.remarks}`.toUpperCase());
+    line => `${line.itemReference} ${line.barcode} ${line.description} ${unitText(line.unit)} ${line.remarks}`.toUpperCase());
   const qtyDecimals = setup?.qtyDecimals ?? 2;
   // Something to save : Add has lines, Modify has a line deleted or changed from the way it was loaded (loadKey),
   // View and Delete change nothing. Without changes : no draft, no question when leaving, nothing to save
@@ -126,10 +138,20 @@ const SupplierReturnScreen = () => {
     setLastDownloadAt(downloadedAt ?? '');
   });
 
+  const ApplyOfflineStatus = (status) => {
+    setIsOnline(status.serverUp);
+    setNetworkUp(status.networkUp);
+    setHasOfflineCatalog(status.hasCatalog);
+    setUseOffline(status.useOffline);
+    return status;
+  };
+
+  const RefreshOfflineStatus = () => SupplierReturnData.GetOfflineStatus().then(ApplyOfflineStatus);
+
   useEffect(() => {
     LoadSetup();
     RefreshOfflineState();
-    return subscribeConnectivity(({ serverUp }) => setIsOnline(serverUp));
+    return subscribeConnectivity(connectivity => SupplierReturnData.OfflineStatusOf(connectivity).then(ApplyOfflineStatus));
   }, []);
 
   // The draft follows every change of the return
@@ -187,10 +209,7 @@ const SupplierReturnScreen = () => {
     infoTapCount.current += 1;
     if (infoTapCount.current >= 7) {
       infoTapCount.current = 0;
-      ServerInfo.getServer().then(server => {
-        setServerDraft(server);
-        setServerModalVisible(true);
-      });
+      OpenServerModal();
       return;
     }
     infoTapTimer.current = setTimeout(() => {
@@ -198,7 +217,35 @@ const SupplierReturnScreen = () => {
     }, 3500);
   };
 
+  const OpenServerModal = () => {
+    ServerInfo.getServer().then(server => {
+      serverDraftRef.current = server;
+      setServerDraft(server);
+      setServerTest({ status: '', message: '' });
+      setServerModalVisible(true);
+    });
+  };
+
+  const ChangeServerDraft = (text) => {
+    serverDraftRef.current = text;
+    setServerDraft(text);
+    setServerTest({ status: '', message: '' });
+  };
+
+  const TestServer = () => {
+    const server = serverDraft.trim();
+    setServerTest({ status: 'testing', message: 'Testing The Connection...' });
+    testServer(server)
+      .then(() => ({ status: 'ok', message: `Connected To ${server}` }))
+      .catch(error => ({ status: 'failed', message: error.message }))
+      // An answer for a server that was changed while testing is ignored
+      .then(result => {
+        if (serverDraftRef.current.trim() === server) setServerTest(result);
+      });
+  };
+
   const SaveServer = () => {
+    if (serverTest.status !== 'ok') return;
     ServerInfo.setServer(serverDraft).then(() => {
       setServerModalVisible(false);
       LoadSetup();
@@ -242,6 +289,7 @@ const SupplierReturnScreen = () => {
         ProgressBox.hide();
         setIsBusy(false);
         RefreshOfflineState();
+        RefreshOfflineStatus();
       });
   };
 
@@ -303,9 +351,34 @@ const SupplierReturnScreen = () => {
       });
   };
 
+  // The server cannot be reached : the buttons stay disabled until the connection works (Change Server or Retry)
+  // or the user chooses Work Offline (the Wi-Fi is on, the downloaded data is the one of this server).
+  // onWorkOffline : what to do once offline (default : load the setup of the downloaded data)
+  const ShowCannotConnect = (message, onWorkOffline = LoadSetup) => {
+    Promise.all([ServerInfo.getServer(), SupplierReturnData.GetOfflineStatus()]).then(([server, status]) => {
+      ApplyOfflineStatus(status);
+      const buttons = [
+        { text: 'Change Server', onPress: OpenServerModal },
+        { text: 'Retry', onPress: LoadSetup },
+      ];
+      if (!status.serverUp && status.networkUp && status.catalogOfServer) {
+        buttons.push({
+          text: 'Work Offline', onPress: () => {
+            SupplierReturnData.SetWorkOffline(true);
+            RefreshOfflineStatus().then(() => onWorkOffline());
+          },
+        });
+      }
+      MessageBox.alert('Cannot Connect', `${message}
+
+Server : ${server}`, buttons);
+    });
+  };
+
   const LoadSetup = () => {
 
     setIsBusy(true);
+    let cannotConnectShown = false;
 
     SupplierReturnData.GetReturnSetup()
       .then(returnSetup => {
@@ -321,32 +394,20 @@ const SupplierReturnScreen = () => {
           draftReady.current = true;
         }
       })
+      // GetReturnSetup already gave the setup of the downloaded data when it can be used
       .catch(error => {
-        OfflineStore.hasCatalog().then(hasCatalog => {
-          if (hasCatalog) {
-            return OfflineStore.getCachedSetup().then(cachedSetup => {
-              if (cachedSetup) {
-                setSetup(cachedSetup);
-                setServiceLocation(cachedSetup.location);
-                draftReady.current = true;
-                return;
-              }
-              throw error;
-            });
-          }
-          throw error;
-        }).catch(() => {
-          ServerInfo.getServer().then(server => {
-            MessageBox.alert('Cannot Connect', `${error.message}
-
-Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
-          });
-        });
+        cannotConnectShown = true;
+        ShowCannotConnect(error.message);
       })
       .finally(() => {
         setIsBusy(false);
         RefreshOfflineState();
-        getConnectivity(true).then(({ serverUp }) => setIsOnline(serverUp));
+        // Without Wi-Fi the downloaded data is used : no Cannot Connect. With Wi-Fi and no server, the server may be wrong
+        RefreshOfflineStatus().then(status => {
+          if (!status.serverUp && !status.useOffline && !cannotConnectShown) {
+            ShowCannotConnect(SupplierReturnData.OfflineMessage(status));
+          }
+        });
       });
 
   };
@@ -407,10 +468,9 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
       LoadSetup();
       return;
     }
-    const { serverUp } = await getConnectivity(true);
-    const offline = !serverUp;
-    if (offline && !hasOfflineCatalog) {
-      ShowError('Download Offline Data While Online Before Using The App Offline.', 'Offline');
+    const status = ApplyOfflineStatus(await SupplierReturnData.GetOfflineStatus());
+    if (!status.serverUp && !status.useOffline) {
+      ShowCannotConnect(SupplierReturnData.OfflineMessage(status), () => StartMode(newMode));
       return;
     }
     ResetForm();
@@ -420,8 +480,7 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
 
   // View (and offline Modify / Delete) : saved returns on device or on server; Add : all active suppliers
   const OpenSupplierPicker = async (forMode = mode) => {
-    const { serverUp } = await getConnectivity(true);
-    const offline = hasOfflineCatalog && !serverUp;
+    const { useOffline: offline } = ApplyOfflineStatus(await SupplierReturnData.GetOfflineStatus());
     if (forMode === 'V' || (offline && (forMode === 'M' || forMode === 'D'))) {
       LoadList(returnSuppliers, setReturnSuppliers, SupplierReturnData.GetReturnSuppliers, true);
     } else {
@@ -452,8 +511,7 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
     setPicker('');
     setIsBusy(true);
 
-    const { serverUp } = await getConnectivity(true);
-    const offline = hasOfflineCatalog && !serverUp;
+    const { useOffline: offline } = ApplyOfflineStatus(await SupplierReturnData.GetOfflineStatus());
 
     if (mode === 'A' && offline) {
       try {
@@ -600,7 +658,7 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
       [...current, line] :
       current.map(currentLine => currentLine.key === line.key ? line : currentLine));
     setEditor(null);
-    ShowNotice(`${editor.isNewLine ? 'Added' : 'Changed'} ${line.itemReference} : ${Number(line.qtyReturn).toFixed(qtyDecimals)} ${line.unit}`);
+    ShowNotice(`${editor.isNewLine ? 'Added' : 'Changed'} ${line.itemReference} : ${Number(line.qtyReturn).toFixed(qtyDecimals)} ${unitText(line.unit)}`.trim());
     focusScanner();
   };
 
@@ -674,7 +732,9 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
           'Saved Successfully');
       })
       .catch(error => {
-        ShowError(error.message, 'Save');
+        // The Wi-Fi is on but the server does not answer : Work Offline saves the return on the device
+        if (error.canWorkOffline) ShowCannotConnect(error.message, SaveReturns);
+        else ShowError(error.message, 'Save');
       })
       .finally(() => setIsBusy(false));
 
@@ -745,7 +805,7 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
         <View style={styles.lineHeader}>
           <Text style={styles.lineReferenceText} numberOfLines={1}>{item.itemReference}</Text>
           <Text style={styles.lineQtyText} numberOfLines={1}>
-            {Number(item.qtyReturn).toFixed(qtyDecimals)} <Text style={styles.lineUnitText}>{item.unit}</Text>
+            {Number(item.qtyReturn).toFixed(qtyDecimals)}{multiUnit ? <Text style={styles.lineUnitText}> {item.unit}</Text> : null}
           </Text>
         </View>
         <Text style={styles.lineDescriptionText} numberOfLines={1}>{item.description}</Text>
@@ -780,7 +840,7 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
       mode === 'A' ? 'Scan Or Search The Items To Return' :
         linesFilter !== '' ? 'Nothing Found' : 'No Returns';
 
-  const pickingSavedOnDevice = !isOnline && hasOfflineCatalog && (mode === 'M' || mode === 'D');
+  const pickingSavedOnDevice = useOffline && (mode === 'M' || mode === 'D');
   const supplierRows = mode === 'V' || pickingSavedOnDevice ? returnSuppliers : suppliers;
 
   return (
@@ -845,6 +905,7 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
         readOnly={!canEditLines}
         warehouses={setup?.warehouses ?? []}
         qtyDecimals={qtyDecimals}
+        multiUnit={setup?.multiUnit !== false}
         onSubmit={SubmitLine}
         onCancel={() => {
           setEditor(null);
@@ -863,12 +924,20 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
             <TextInput
               style={styles.serverInput}
               value={serverDraft}
-              onChangeText={setServerDraft}
+              onChangeText={ChangeServerDraft}
               autoCapitalize='none'
               autoCorrect={false}
             />
+            {serverTest.message !== '' ?
+              <Text style={[styles.serverTestText, serverTest.status === 'ok' ? styles.serverTestOk : null, serverTest.status === 'failed' ? styles.serverTestFailed : null]}>
+                {serverTest.message}
+              </Text> :
+              <></>}
             <View style={styles.serverModalButtons}>
-              <MainButton title='Save' onPress={SaveServer} style={styles.serverSaveButton} />
+              <MainButton title='Test Connection' onPress={TestServer} style={styles.serverButton}
+                disabled={serverDraft.trim() === '' || serverTest.status === 'testing'} />
+              <MainButton title='Save' onPress={SaveServer} style={styles.serverButton}
+                disabled={serverTest.status !== 'ok'} />
             </View>
           </View>
         </View>
@@ -911,7 +980,7 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
                   <Text style={styles.lineReferenceText} numberOfLines={1}>{item.itemReference}</Text>
                   <Text style={styles.lineDescriptionText} numberOfLines={1}>{item.description}</Text>
                   <Text style={styles.lineDetailText} numberOfLines={1}>
-                    {Number(item.qtyReturn).toFixed(qtyDecimals)} {item.unit} · WH {item.warehouse}{item.remarks ? ' · ' + item.remarks : ''}
+                    {Number(item.qtyReturn).toFixed(qtyDecimals)}{unitText(item.unit) ? ' ' + unitText(item.unit) : ''} · WH {item.warehouse}{item.remarks ? ' · ' + item.remarks : ''}
                   </Text>
                 </View>
               </View>
@@ -936,12 +1005,12 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
             ]}>
             {({ pressed }) => (
               <Text style={[styles.infoText, pressed && styles.infoTextPressed]} numberOfLines={1}>
-                User {setup?.userCode ?? ''} · Location {setup?.location ?? ''}
+                User {DeviceInfo.getDeviceNameSync()} · Location {setup?.location ?? ''}
               </Text>
             )}
           </Pressable> :
           <Text style={styles.infoTextStatic} numberOfLines={1}>
-            User {setup?.userCode ?? ''} · Location {setup?.location ?? ''}
+            User {DeviceInfo.getDeviceNameSync()} · Location {setup?.location ?? ''}
           </Text>}
       </View>
 
@@ -949,10 +1018,12 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
         <>
           <View style={styles.homeMain}>
             <View style={styles.homeContainer}>
-              <HomeButton title='View' description='See The Returns' imageSource={require('../assets/icons/viewReturns.png')} newMode='V' />
-              <HomeButton title='Add' description='New Returns' imageSource={require('../assets/icons/add.png')} newMode='A' />
-              <HomeButton title='Modify' description='Change Returns' imageSource={require('../assets/icons/ReturnOrders.png')} newMode='M' />
-              <HomeButton title='Delete' description='All The Returns' imageSource={require('../assets/icons/deleteLine.png')} newMode='D' />
+              {/* Offline, the returns work with the downloaded data of this server : directly without Wi-Fi,
+                  after Work Offline (Cannot Connect) with Wi-Fi, else all the buttons are disabled */}
+              <HomeButton title='View' description='See The Returns' imageSource={require('../assets/icons/viewReturns.png')} newMode='V' disabled={!isOnline && !useOffline} />
+              <HomeButton title='Add' description='New Returns' imageSource={require('../assets/icons/add.png')} newMode='A' disabled={!isOnline && !useOffline} />
+              <HomeButton title='Modify' description='Change Returns' imageSource={require('../assets/icons/ReturnOrders.png')} newMode='M' disabled={!isOnline && !useOffline} />
+              <HomeButton title='Delete' description='All The Returns' imageSource={require('../assets/icons/deleteLine.png')} newMode='D' disabled={!isOnline && !useOffline} />
               <HomeButton
                 title='Download'
                 description='For Offline Work'
@@ -973,14 +1044,19 @@ Server : ${server}`, [{ text: 'Retry', onPress: LoadSetup }]);
             <View style={styles.footerStatusRow}>
               <View style={styles.footerOnlineGroup}>
                 <View style={[styles.connectivityRing, isOnline ? styles.connectivityOnline : styles.connectivityOffline]} />
-                <Text style={styles.footerStatusText}>{isOnline ? 'Online' : 'Offline'}</Text>
+                <Text style={styles.footerStatusText}>
+                  {isOnline ? 'Online' :
+                    useOffline ? 'Offline · Using Downloaded Data' :
+                      networkUp ? 'Offline · Cannot Connect To The Server' : 'Offline · No Wi-Fi'}
+                </Text>
               </View>
-              {hasOfflineCatalog && lastDownloadAt ?
-                <Text style={styles.footerDownloadText} numberOfLines={1}>
-                  Last Download : {formatDownloadDateTime(lastDownloadAt)}
-                </Text> :
-                <></>}
             </View>
+            {/* The last download on its own line (online, or offline with the downloaded data) : nothing is cut */}
+            {(isOnline || useOffline) && hasOfflineCatalog && lastDownloadAt ?
+              <Text style={styles.footerDownloadText}>
+                Last Download : {formatDownloadDateTime(lastDownloadAt)}
+              </Text> :
+              <></>}
           </View>
         </> :
         <>
@@ -1092,17 +1168,17 @@ const styles = StyleSheet.create({
     alignItems: 'center',
     justifyContent: 'space-between',
   },
+  // The status wraps on a narrow screen instead of going past the right side
   footerOnlineGroup: {
     flexDirection: 'row',
     alignItems: 'center',
-    flexShrink: 0,
+    flexShrink: 1,
   },
   footerDownloadText: {
-    flex: 1,
-    marginLeft: 10,
+    marginTop: 4,
+    marginLeft: 22,
     fontSize: FontSize(12),
     color: 'white',
-    textAlign: 'right',
   },
   connectivityRing: {
     width: 14,
@@ -1119,6 +1195,7 @@ const styles = StyleSheet.create({
     backgroundColor: '#ff4136',
   },
   footerStatusText: {
+    flexShrink: 1,
     fontSize: FontSize(16),
     color: 'white',
     fontWeight: 'bold',
@@ -1193,12 +1270,26 @@ const styles = StyleSheet.create({
     fontSize: FontSize(16),
     color: 'black',
   },
-  serverModalButtons: {
-    paddingHorizontal: 12,
-    paddingBottom: 12,
+  serverTestText: {
+    marginHorizontal: 12,
+    marginBottom: 10,
+    fontSize: FontSize(14),
+    color: 'black',
   },
-  serverSaveButton: {
-    width: '100%',
+  serverTestOk: {
+    color: 'green',
+  },
+  serverTestFailed: {
+    color: 'red',
+  },
+  serverModalButtons: {
+    flexDirection: 'row',
+    justifyContent: 'space-between',
+    paddingHorizontal: 12,
+    paddingBottom: 2,
+  },
+  serverButton: {
+    width: '49%',
   },
   homeContainer: {
     flex: 1,

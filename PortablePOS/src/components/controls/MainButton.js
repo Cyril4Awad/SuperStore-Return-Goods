@@ -7,13 +7,14 @@ import { FontSize } from '../../variables/ResponsiveFont';
 // imageSource (optional) : icon shown at the left of the title, the button is taller with an icon
 // secondImageSource (optional) : a second icon next to the first one, both smaller so the title still fits
 // style (optional) : style of the button container (e.g. its width when three buttons share a row)
+// disabled (optional) : the button is faded and cannot be pressed
 const MainButton = props => {
 
     const imageStyle = props.secondImageSource ? [styles.buttonImage, styles.buttonImageSmall] : styles.buttonImage;
 
     return (
-        <View style={[styles.container, props.imageSource ? styles.containerWithImage : null, props.style]}>
-            <TouchableOpacity style={[styles.button, props.imageSource ? styles.buttonWithImage : null]} onPress={props.onPress}>
+        <View style={[styles.container, props.imageSource ? styles.containerWithImage : null, props.style, props.disabled ? styles.containerDisabled : null]}>
+            <TouchableOpacity style={[styles.button, props.imageSource ? styles.buttonWithImage : null]} onPress={props.onPress} disabled={props.disabled}>
                 {props.imageSource ?
                     <Image
                         source={props.imageSource}
@@ -47,6 +48,9 @@ const styles = StyleSheet.create({
     },
     containerWithImage: {
         height: 50,
+    },
+    containerDisabled: {
+        opacity: 0.45,
     },
     button: {
         width : '100%',

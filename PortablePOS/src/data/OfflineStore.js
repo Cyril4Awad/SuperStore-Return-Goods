@@ -185,7 +185,8 @@ export const saveWarehouseStockPage = (rows) => runBatch(insertStatements('item_
     row.display ?? '',
 ]));
 
-export const finishCatalogDownload = ({ setup, suppliers, productGroups }) => runBatch([
+// server : the server of the download, the data (and the returns saved with it) belong to that server
+export const finishCatalogDownload = ({ setup, suppliers, productGroups, server }) => runBatch([
     'DROP TABLE IF EXISTS stock_items',
     'ALTER TABLE stock_items_dl RENAME TO stock_items',
     ...STOCK_ITEMS_INDEXES,
@@ -200,7 +201,11 @@ export const finishCatalogDownload = ({ setup, suppliers, productGroups }) => ru
     ['INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', ['setup', JSON.stringify(setup)]],
     ['INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', ['catalogReady', '1']],
     ['INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', ['downloadedAt', new Date().toISOString()]],
+    ['INSERT OR REPLACE INTO meta (key, value) VALUES (?, ?)', ['server', server ?? '']],
 ]);
+
+// The server of the downloaded data, null for a download made before the server was kept
+export const getCatalogServer = async () => (await getMeta('server')) || null;
 
 export const getSuppliers = async () => {
     await ensureSchema();
@@ -256,8 +261,9 @@ export const findReturnItem = async (code, itemRecID = '') => {
         };
     }
     const row = distinct[0];
+    // Without the units (multiUnit false) the item may have no unit : its stock rows have the unit ''
     const unit = row.basicUnit || '';
-    const stock = unit ? await getItemStockRows(row.itemRecID, unit) : [];
+    const stock = await getItemStockRows(row.itemRecID, unit);
     return {
         item: {
             itemRecID: row.itemRecID,
@@ -291,7 +297,7 @@ export const getItemUnits = async (itemRecID) => {
 export const getItemUnit = async (itemRecID, unit) => {
     const result = await findReturnItem('', itemRecID);
     const chosenUnit = unit || result.item.unit;
-    const stock = chosenUnit ? await getItemStockRows(itemRecID, chosenUnit) : [];
+    const stock = await getItemStockRows(itemRecID, chosenUnit);
     return {
         unit: chosenUnit,
         barcode: result.item.barcode,
@@ -395,6 +401,7 @@ export default {
     hasCatalog,
     getCachedSetup,
     getDownloadedAt,
+    getCatalogServer,
     beginCatalogDownload,
     discardCatalogDownload,
     saveStockItemsPage,

@@ -57,6 +57,10 @@ These values are built into the APK and the user cannot change them. Edit the fi
 
 `AppConnectionString` is the SuperStore database connection string, encrypted the same way as the services (`DecryptString` in `modCommon.vb`).
 
+| `appSettings` key | Meaning |
+|-----|---------|
+| `MultiUnit` | `1` (the default when it is missing): the database has item units (`tbl_StockUnit`, `Sr_StkUnit`, `BSy_UnitCode`). `0`: an older database without them, such as `superstore_main`. Each item has one unit (`Stk_UnitCode`, else `Stk_Packing`), the search uses `tbl_StockItm` alone, returns are saved without `Sr_StkUnit`, and the app shows the unit as read-only. To change the unit, pick another item. |
+
 ## Build and deploy
 
 ### Web service

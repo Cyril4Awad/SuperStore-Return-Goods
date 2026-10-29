@@ -36,7 +36,8 @@ const linesEqual = (left, right, qtyDecimals) => {
 // the quantity to return, the warehouse and the remarks; Qty In Warehouses shows the stock of the item in each warehouse (in the unit)
 // The unit and the warehouse are changed on the lines added (Add), Modify changes the quantity and the remarks, View changes nothing
 // Remarks opens a box at the top of the screen, the keyboard does not cover what is typed
-// props : visible, line, isNewLine, readOnly, warehouses [{ code, description }], qtyDecimals, onSubmit(line), onCancel
+// multiUnit false (the database has no units) : the unit is the one of the item, it cannot be changed (another item changes it)
+// props : visible, line, isNewLine, readOnly, warehouses [{ code, description }], qtyDecimals, multiUnit, onSubmit(line), onCancel
 const ReturnLineEditor = props => {
 
     const [line, setLine] = useState(null);
@@ -80,6 +81,9 @@ const ReturnLineEditor = props => {
 
     // A line added (not saved yet) : its unit and warehouse can change
     const canChangeItem = !props.readOnly && line.state === 'A';
+    const multiUnit = props.multiUnit !== false;
+    const canChangeUnit = canChangeItem && multiUnit;
+    const unitText = line.unit === line.basicUnit ? line.unit : `${line.unit} (Base ${line.basicUnit})`;
 
     const qtyText = (value) => (Number(value) || 0).toFixed(props.qtyDecimals);
 
@@ -167,8 +171,9 @@ const ReturnLineEditor = props => {
             MessageBox.alert('Return Qty', 'Quantity To Return Must Be Greater Than 0');
             return;
         }
-        if (!line.unit || !line.warehouse) {
-            MessageBox.alert('Return Line', 'Please Fill The Unit And The Warehouse');
+        // Without the units the item may have no unit
+        if ((multiUnit && !line.unit) || !line.warehouse) {
+            MessageBox.alert('Return Line', multiUnit ? 'Please Fill The Unit And The Warehouse' : 'Please Fill The Warehouse');
             return;
         }
         if (!props.isNewLine && !hasChanges()) {
@@ -218,7 +223,7 @@ const ReturnLineEditor = props => {
                 <Modal visible={stockVisible} transparent={true} presentationStyle="overFullScreen" onRequestClose={() => setStockVisible(false)}>
                     <View style={styles.modalContainer}>
                         <View style={styles.modalCard}>
-                            <ModalTitle title={`Qty In Warehouses (${line.unit})`} onCloseButtonPress={() => setStockVisible(false)} />
+                            <ModalTitle title={multiUnit ? `Qty In Warehouses (${line.unit})` : 'Qty In Warehouses'} onCloseButtonPress={() => setStockVisible(false)} />
                             <FlatList
                                 data={line.stock ?? []}
                                 keyExtractor={(stock) => stock.warehouse}
@@ -274,10 +279,12 @@ const ReturnLineEditor = props => {
                         <Text style={styles.descriptionText} numberOfLines={2}>{line.description}</Text>
                     </View>
 
+                    {/* Without the units the Unit field is not shown, Qty In Warehouses takes the row */}
                     <View style={choiceRowStyle.row}>
-                        <ChoiceField title='Unit' value={line.unit === line.basicUnit ? line.unit : `${line.unit} (Base ${line.basicUnit})`}
-                            onPress={canChangeItem ? ChooseUnit : undefined}
-                            style={{ borderBottomWidth: 0 }} />
+                        {multiUnit ?
+                            <ChoiceField title='Unit' value={unitText}
+                                onPress={canChangeUnit ? ChooseUnit : undefined}
+                                style={{ borderBottomWidth: 0 }} /> : null}
                         <ChoiceField title='Qty In Warehouses'
                             value={`${(line.stock ?? []).length} Warehouses`}
                             onPress={() => setStockVisible(true)}
@@ -288,7 +295,7 @@ const ReturnLineEditor = props => {
                     <View style={styles.qtyRow} onLayout={(event) => { qtyRowY.current = event.nativeEvent.layout.y; }}>
                         <Text style={[choiceTitleTextStyle, styles.qtyTitleText]}>Return Qty</Text>
                         {props.readOnly ?
-                            <Text style={styles.qtyReadOnlyText}>{qtyText(line.qtyReturn)} {line.unit}</Text> :
+                            <Text style={styles.qtyReadOnlyText}>{qtyText(line.qtyReturn)}{multiUnit ? ` ${line.unit}` : ''}</Text> :
                             <>
                                 <TouchableOpacity style={styles.qtyButton} onPress={() => ChangeQty(-1)}>
                                     <Text style={styles.qtyButtonText}>−</Text>

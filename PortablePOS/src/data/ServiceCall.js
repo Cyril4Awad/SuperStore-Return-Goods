@@ -16,9 +16,12 @@ const DEFAULT_TIMEOUT_MS = 30000;
 // Returns the result string of the method, rejects with a clear message : the server cannot be reached,
 // the server failed (HTTP error), it took too long, or the error of the method ("Error ..." of the web service)
 // timeoutMs : stops waiting after that time (the request may still finish on the server)
-export const callService = (method, body, timeoutMs = DEFAULT_TIMEOUT_MS) => {
+// server (optional) : calls this server instead of the saved one (the test of the server form)
+export const callService = (method, body, timeoutMs = DEFAULT_TIMEOUT_MS, server = null) => {
 
-    const request = ServerInfo.serverURL().then(serverURL => {
+    const serverURLRequest = server ? Promise.resolve(ServerInfo.urlOf(server)) : ServerInfo.serverURL();
+
+    const request = serverURLRequest.then(serverURL => {
 
         const server = serverURL.replace(/^http:\/\//, '').split('/')[0];
 

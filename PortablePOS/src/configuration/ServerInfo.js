@@ -7,9 +7,10 @@ const ServerInfo = {
 
     serverURL: async () => {
         const saved = await AsyncStorage.getItem(serverStorageKey);
-        const server = (saved && saved.trim()) || AppSettings.server;
-        return 'http://' + server + '/SuperStoreReturnGoods_WS/dataservice.svc/Web/';
+        return ServerInfo.urlOf((saved && saved.trim()) || AppSettings.server);
     },
+
+    urlOf: (server) => 'http://' + server.trim() + '/SuperStoreReturnGoods_WS/dataservice.svc/Web/',
 
     getServer: async () => {
         const saved = await AsyncStorage.getItem(serverStorageKey);

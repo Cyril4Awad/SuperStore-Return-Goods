@@ -16,35 +16,51 @@ Public Class DataService
 
 #Region "Setup"
 
-    'The active warehouses of the location (GetWarehousesList) and the default one (Ld_DefaultWarehouse)
-    'Returns {warehouses: [{code, description}], defaultWarehouse, qtyDecimals}
+    'The qty shown in the unit, the SQL of the function dbo.QtyDisplay of SuperStore (not in the older databases) :
+    'the qty in the unit, followed by ( qty basic unit ) when the unit is not the basic unit
+    'Without the units (MultiUnit 0) : the qty of the item
+    Private Function QtyDisplaySql(unitColumn As String) As String
+        If Not AppMultiUnit Then Return " CONVERT(VARCHAR(30), CONVERT(NUMERIC(18, 2), ISNULL(Qty_AvlbQty, 0))) "
+        Return $" CONCAT(CONVERT(NUMERIC(18, 2), ISNULL(Qty_AvlbQty, 0) / ISNULL(SUnit_PackingBasic, 1)),
+                         CASE WHEN Stk_UnitCode = {unitColumn} THEN ''
+                              ELSE CONCAT(' ( ', CONVERT(NUMERIC(18, 2), ISNULL(Qty_AvlbQty, 0)), ' ', Stk_UnitCode, ' )')
+                         END) "
+    End Function
+
+    'Without the units (MultiUnit 0) : the one unit of the item (Stk_UnitCode, else its packing), "" when it has none
+    Private Const ItemUnitSql As String = " ISNULL(NULLIF(LTRIM(RTRIM(Stk_UnitCode)), ''), ISNULL(LTRIM(RTRIM(Stk_Packing)), '')) "
+
+    'The basic unit of the item : the one unit of the item without the units
+    Private Function BasicUnitSql() As String
+        Return If(AppMultiUnit, " ISNULL(Stk_UnitCode, '') ", ItemUnitSql)
+    End Function
+
+    'The warehouses of the location (GetWarehousesList), the older databases have no Wh_Active and no default warehouse (tbl_LocationDirectives)
+    'Returns {warehouses: [{code, description}], defaultWarehouse, qtyDecimals, multiUnit}
+    'multiUnit false : the unit of a line is the unit of its item, it cannot be changed
     Public Function GetReturnSetup(location As String) As String Implements IDataService.GetReturnSetup
 
         Try
 
             location = AppLocation
             If String.IsNullOrWhiteSpace(location) Then Return "Error Location Is Not Configured"
-            If String.IsNullOrWhiteSpace(AppUserCode) Then Return "Error User Code Is Not Configured"
+            If String.IsNullOrWhiteSpace(RequestUserCode) Then Return "Error User Code Is Not Configured"
 
             Dim warehouses = GetTable(" SELECT  CONVERT(VARCHAR(2), Wh_Code) [code] ,
                                                 Wh_Description [description]
                                         FROM    tbl_Warehouses
                                         WHERE   Wh_Loc = @Loc
-                                                AND ISNULL(Wh_Active, 'N') = 'Y'
                                         ORDER BY Wh_Code ", P("@Loc", location))
 
-            Dim defaultWarehouse = GetTable(" SELECT CONVERT(VARCHAR(2), Ld_DefaultWarehouse) [defaultWarehouse]
-                                              FROM   tbl_LocationDirectives
-                                              WHERE  Ld_Loc = @Loc ", P("@Loc", location))
-
-            If warehouses.Rows.Count = 0 Then Return "Error No Active Warehouse For The Location " & location
+            If warehouses.Rows.Count = 0 Then Return "Error No Warehouse For The Location " & location
 
             Return Serialize(New Dictionary(Of String, Object) From {
                 {"warehouses", TableRows(warehouses)},
-                {"defaultWarehouse", If(defaultWarehouse.Rows.Count = 0, "", defaultWarehouse.Rows(0)("defaultWarehouse").ToString)},
+                {"defaultWarehouse", ""},
                 {"qtyDecimals", QtyDecimals},
+                {"multiUnit", AppMultiUnit},
                 {"location", location},
-                {"userCode", AppUserCode}
+                {"userCode", RequestUserCode}
             })
 
         Catch ex As Exception
@@ -118,36 +134,39 @@ Public Class DataService
             Dim supplier = FindSupplier(location, supplierCode, Not forView)
             If supplier Is Nothing Then Return "Error Invalid Supplier"
 
-            Dim lines = GetTable(" SELECT  CONVERT(VARCHAR(18), Sr_StkId) [itemRecID] ,
+            'Without the units (MultiUnit 0) the returns have no unit (Sr_StkUnit) : the unit of the item
+            Dim unitJoin = If(AppMultiUnit, " INNER JOIN tbl_StockUnit ON SUnit_Loc = Sr_Loc AND SUnit_StkId = Sr_StkId AND SUnit_Unit = Sr_StkUnit ", "")
+
+            Dim lines = GetTable($" SELECT  CONVERT(VARCHAR(18), Sr_StkId) [itemRecID] ,
                                            CONVERT(INT, Sr_Counter) [counter] ,
                                            CAST(Stk_Supplier AS VARCHAR(4)) + '/' + CAST(Stk_Category AS VARCHAR(3)) + '/' + CAST(Stk_Serial AS NVARCHAR(6)) [itemReference] ,
-                                           Sr_StkUnit [unit] ,
-                                           ISNULL(NULLIF(SUnit_SpecDesc, ''), Stk_Desc) [description] ,
+                                           {If(AppMultiUnit, "Sr_StkUnit", ItemUnitSql)} [unit] ,
+                                           {If(AppMultiUnit, "ISNULL(NULLIF(SUnit_SpecDesc, ''), Stk_Desc)", "ISNULL(Stk_Desc, '')")} [description] ,
                                            ISNULL(COALESCE(Stk_Barcode1, Stk_Barcode2), '') [barcode] ,
                                            FORMAT(Sr_Date, 'dd/MM/yyyy') [date] ,
-                                           Stk_UnitCode [basicUnit] ,
+                                           {BasicUnitSql()} [basicUnit] ,
                                            Sr_QtyReturn [qtyReturn] ,
                                            Sr_QtyReturn [oldQtyReturn] ,
                                            CONVERT(VARCHAR(2), Sr_Whouse) [warehouse] ,
                                            ISNULL(Sr_Remarks, '') [remarks]
                                    FROM    tbl_SupplierReturns
                                            INNER JOIN tbl_StockItm ON Stk_Loc = Sr_Loc AND Stk_StkId = Sr_StkId
-                                           INNER JOIN tbl_StockUnit ON SUnit_Loc = Sr_Loc AND SUnit_StkId = Sr_StkId AND SUnit_Unit = Sr_StkUnit
+                                           {unitJoin}
                                    WHERE   Sr_Loc = @Loc
                                            AND Sr_Supplier = @Supplier
                                    ORDER BY Sr_Date , Sr_StkId , Sr_Counter ",
                                  P("@Loc", location), P("@Supplier", supplier("code")))
 
-            'The stock of the items of the returns in the active warehouses, shown in the unit of the return
-            Dim stock = GetTable(" SELECT  CONVERT(VARCHAR(18), Sr_StkId) [itemRecID] ,
+            'The stock of the items of the returns in the warehouses, shown in the unit of the return
+            Dim stock = GetTable($" SELECT  CONVERT(VARCHAR(18), Sr_StkId) [itemRecID] ,
                                            CONVERT(INT, Sr_Counter) [counter] ,
                                            CONVERT(VARCHAR(2), Wh_Code) [warehouse] ,
                                            ISNULL(Qty_AvlbQty, 0) [qty] ,
-                                           ISNULL(dbo.QtyDisplay(Qty_AvlbQty, SUnit_Unit, Stk_UnitCode, ISNULL(SUnit_PackingBasic, 1)), '') [display]
+                                           {QtyDisplaySql("SUnit_Unit")} [display]
                                    FROM    tbl_SupplierReturns
                                            INNER JOIN tbl_StockItm ON Stk_Loc = Sr_Loc AND Stk_StkId = Sr_StkId
-                                           INNER JOIN tbl_StockUnit ON SUnit_Loc = Sr_Loc AND SUnit_StkId = Sr_StkId AND SUnit_Unit = Sr_StkUnit
-                                           INNER JOIN tbl_Warehouses ON Wh_Loc = Sr_Loc AND ISNULL(Wh_Active, 'N') = 'Y'
+                                           {unitJoin}
+                                           INNER JOIN tbl_Warehouses ON Wh_Loc = Sr_Loc
                                            LEFT JOIN tbl_StockQty ON Qty_Loc = Sr_Loc AND Qty_Stkid = Sr_StkId AND Qty_WH = Wh_Code
                                    WHERE   Sr_Loc = @Loc
                                            AND Sr_Supplier = @Supplier
@@ -211,23 +230,24 @@ Public Class DataService
             Dim recID As Decimal = 0
             Decimal.TryParse(If(itemRecID, "").Trim, recID)
 
+            'Without the units (MultiUnit 0) the barcode synonyms have no unit (BSy_UnitCode) : the item in its one unit
             Dim items = GetTable($" SELECT  CONVERT(VARCHAR(18), Stk_StkId) [itemRecID] ,
-                                            ISNULL(BSy_UnitCode, Stk_UnitCode) [unit] ,
+                                            {If(AppMultiUnit, "ISNULL(BSy_UnitCode, Stk_UnitCode)", ItemUnitSql)} [unit] ,
                                             CAST(Stk_Supplier AS VARCHAR(4)) + '/' + CAST(Stk_Category AS VARCHAR(3)) + '/' + CAST(Stk_Serial AS NVARCHAR(6)) [itemReference] ,
-                                            ISNULL(NULLIF(SUnit_SpecDesc, ''), Stk_Desc) [description] ,
+                                            {If(AppMultiUnit, "ISNULL(NULLIF(SUnit_SpecDesc, ''), Stk_Desc)", "ISNULL(Stk_Desc, '')")} [description] ,
                                             ISNULL(COALESCE(Bsy_Barcode, Stk_Barcode1, Stk_Barcode2), '') [barcode] ,
-                                            Stk_UnitCode [basicUnit] ,
-                                            ISNULL(SUnit_PackingBasic, 1) [packingBasic] ,
+                                            {BasicUnitSql()} [basicUnit] ,
+                                            {If(AppMultiUnit, "ISNULL(SUnit_PackingBasic, 1)", "1")} [packingBasic] ,
                                             FORMAT(GETDATE(), 'dd/MM/yyyy') [date]
                                     FROM    tbl_StockItm
-                                            LEFT JOIN ( SELECT  BSy_Loc , Bsy_Stkid , BSy_UnitCode , Bsy_Barcode
+                                            LEFT JOIN ( SELECT  BSy_Loc , Bsy_Stkid , {If(AppMultiUnit, "BSy_UnitCode ,", "")} Bsy_Barcode
                                                         FROM    tbl_BarcodeSyn
                                                         WHERE   Bsy_Barcode = @Code
                                                       ) tbl_BarcodeSyn ON tbl_BarcodeSyn.BSy_Loc = tbl_StockItm.Stk_Loc
                                                                           AND tbl_BarcodeSyn.Bsy_Stkid = tbl_StockItm.Stk_StkId
-                                            LEFT JOIN tbl_StockUnit ON SUnit_Loc = Stk_Loc
+                                            {If(AppMultiUnit, "LEFT JOIN tbl_StockUnit ON SUnit_Loc = Stk_Loc
                                                                        AND SUnit_StkId = Stk_StkId
-                                                                       AND SUnit_Unit = ISNULL(BSy_UnitCode, Stk_UnitCode)
+                                                                       AND SUnit_Unit = ISNULL(BSy_UnitCode, Stk_UnitCode)", "")}
                                     WHERE   Stk_Loc = @Loc
                                             AND ISNULL(Stk_Status, 'I') = 'A'
                                             AND ( CAST(Stk_Supplier AS VARCHAR(4)) + '/' + CAST(Stk_Category AS VARCHAR(3)) + '/' + CAST(Stk_Serial AS NVARCHAR(6)) = @Code
@@ -274,12 +294,12 @@ Public Class DataService
             location = AppLocation
             If String.IsNullOrWhiteSpace(location) Then Return "Error Location Is Not Configured"
 
-            Dim items = GetTable(" SELECT  CONVERT(VARCHAR(18), Stk_StkId) [itemRecID] ,
+            Dim items = GetTable($" SELECT  CONVERT(VARCHAR(18), Stk_StkId) [itemRecID] ,
                                            CAST(Stk_Supplier AS VARCHAR(4)) + '/' + CAST(Stk_Category AS VARCHAR(3)) + '/' + CAST(Stk_Serial AS NVARCHAR(6)) [itemReference] ,
                                            ISNULL(Stk_Desc, '') [description] ,
                                            ISNULL(COALESCE(Stk_Barcode1, Stk_Barcode2), '') [barcode] ,
                                            ISNULL(Stk_Category, '') [productGroup] ,
-                                           ISNULL(Stk_UnitCode, '') [basicUnit]
+                                           {BasicUnitSql()} [basicUnit]
                                    FROM    tbl_StockItm
                                    WHERE   Stk_Loc = @Loc
                                            AND Stk_Status = 'A'
@@ -320,16 +340,23 @@ Public Class DataService
                                                      AND Stk_ItmService = 'I'
                                                      AND Stk_3rdParty = 'N' "
 
-    'Qty in warehouses : every active unit of every returnable item, in every active warehouse
-    Private Const OfflineStockJoins As String = " FROM    tbl_StockItm
-                                                         INNER JOIN tbl_StockUnit ON SUnit_Loc = Stk_Loc
-                                                                                     AND SUnit_StkId = Stk_StkId
-                                                                                     AND ISNULL(SUnit_Active, 'N') = 'Y'
-                                                         INNER JOIN tbl_Warehouses ON Wh_Loc = Stk_Loc
-                                                                                      AND ISNULL(Wh_Active, 'N') = 'Y'
-                                                         LEFT JOIN tbl_StockQty ON Qty_Loc = Stk_Loc
-                                                                                   AND Qty_Stkid = Stk_StkId
-                                                                                   AND Qty_WH = Wh_Code "
+    'Qty in warehouses : every active unit of every returnable item, in every warehouse
+    '(without the units, MultiUnit 0 : the one unit of every returnable item)
+    Private Function OfflineStockJoins() As String
+        Return $" FROM    tbl_StockItm
+                          {If(AppMultiUnit, "INNER JOIN tbl_StockUnit ON SUnit_Loc = Stk_Loc
+                                                                     AND SUnit_StkId = Stk_StkId
+                                                                     AND ISNULL(SUnit_Active, 'N') = 'Y'", "")}
+                          INNER JOIN tbl_Warehouses ON Wh_Loc = Stk_Loc
+                          LEFT JOIN tbl_StockQty ON Qty_Loc = Stk_Loc
+                                                    AND Qty_Stkid = Stk_StkId
+                                                    AND Qty_WH = Wh_Code "
+    End Function
+
+    'The unit of the qty in warehouses rows
+    Private Function OfflineStockUnitSql() As String
+        Return If(AppMultiUnit, "SUnit_Unit", ItemUnitSql)
+    End Function
 
     'The size of the download, asked first so the progress of the device has its total from the start
     'Returns {suppliers, items, stockRows, productGroups: [{code, description, items}]}
@@ -342,7 +369,7 @@ Public Class DataService
 
             Dim counts = GetTable($" SELECT ( SELECT COUNT(*) FROM tbl_Suppliers WHERE Sup_Loc = @Loc AND ISNULL(Sup_Active, 'N') = 'Y' ) [suppliers] ,
                                             ( SELECT COUNT(*) FROM tbl_StockItm WHERE {OfflineItemsCondition} ) [items] ,
-                                            ( SELECT COUNT(*) {OfflineStockJoins} WHERE {OfflineItemsCondition} ) [stockRows] ",
+                                            ( SELECT COUNT(*) {OfflineStockJoins()} WHERE {OfflineItemsCondition} ) [stockRows] ",
                                   P("@Loc", location))
 
             Dim productGroups = GetTable($" SELECT  ISNULL(Stk_Category, '') [code] ,
@@ -383,7 +410,7 @@ Public Class DataService
                                             ISNULL(Stk_Desc, '') [description] ,
                                             ISNULL(COALESCE(Stk_Barcode1, Stk_Barcode2), '') [barcode] ,
                                             ISNULL(Stk_Category, '') [productGroup] ,
-                                            ISNULL(Stk_UnitCode, '') [basicUnit]
+                                            {BasicUnitSql()} [basicUnit]
                                     FROM    tbl_StockItm
                                     WHERE   {OfflineItemsCondition}
                                             AND Stk_StkId > @AfterRecID
@@ -410,19 +437,21 @@ Public Class DataService
             location = AppLocation
             If String.IsNullOrWhiteSpace(location) Then Return "Error Location Is Not Configured"
 
+            'Without the units an item has one unit : the rows of the item go by warehouse
+            Dim unitSql = OfflineStockUnitSql()
             Dim rows = GetTable($" SELECT  TOP (@PageSize)
                                            CONVERT(VARCHAR(18), Stk_StkId) [itemRecID] ,
-                                           SUnit_Unit [unit] ,
+                                           {unitSql} [unit] ,
                                            CONVERT(VARCHAR(2), Wh_Code) [warehouse] ,
                                            ISNULL(Qty_AvlbQty, 0) [qty] ,
-                                           ISNULL(dbo.QtyDisplay(Qty_AvlbQty, SUnit_Unit, Stk_UnitCode, ISNULL(SUnit_PackingBasic, 1)), '') [display]
-                                   {OfflineStockJoins}
+                                           {QtyDisplaySql("SUnit_Unit")} [display]
+                                   {OfflineStockJoins()}
                                    WHERE   {OfflineItemsCondition}
                                            AND Stk_StkId >= @AfterRecID
                                            AND ( Stk_StkId > @AfterRecID
-                                                 OR SUnit_Unit > @AfterUnit
-                                                 OR ( SUnit_Unit = @AfterUnit AND Wh_Code > @AfterWarehouse ) )
-                                   ORDER BY Stk_StkId , SUnit_Unit , Wh_Code ",
+                                                 OR {unitSql} > @AfterUnit
+                                                 OR ( {unitSql} = @AfterUnit AND Wh_Code > @AfterWarehouse ) )
+                                   ORDER BY Stk_StkId , {unitSql} , Wh_Code ",
                                  P("@Loc", location),
                                  P("@AfterRecID", ToRecID(afterRecID)),
                                  P("@AfterUnit", If(afterUnit, "")),
@@ -451,6 +480,16 @@ Public Class DataService
             location = AppLocation
             If String.IsNullOrWhiteSpace(location) Then Return "Error Location Is Not Configured"
 
+            'Without the units (MultiUnit 0) : the one unit of the item
+            If Not AppMultiUnit Then
+                Return GetJson(GetTable($" SELECT  {ItemUnitSql} [code] ,
+                                                   ISNULL(Stk_Desc, '') [description]
+                                           FROM    tbl_StockItm
+                                           WHERE   Stk_Loc = @Loc
+                                                   AND Stk_StkId = @ItemRecID ",
+                                        P("@Loc", location), P("@ItemRecID", ToRecID(itemRecID))))
+            End If
+
             Return GetJson(GetTable(" SELECT  SUnit_Unit [code] ,
                                               ISNULL(NULLIF(SUnit_SpecDesc, ''), Stk_Desc) [description]
                                       FROM    tbl_StockUnit
@@ -478,6 +517,20 @@ Public Class DataService
 
             unit = If(unit, "").Trim.ToUpper
 
+            'Without the units (MultiUnit 0) : the one unit of the item, the barcode of the item stays
+            If Not AppMultiUnit Then
+                Dim item = GetTable($" SELECT  {ItemUnitSql} [unit] ,
+                                               '' [barcode]
+                                       FROM    tbl_StockItm
+                                       WHERE   Stk_Loc = @Loc
+                                               AND Stk_StkId = @ItemRecID ",
+                                    P("@Loc", location), P("@ItemRecID", ToRecID(itemRecID)))
+                If item.Rows.Count = 0 Then Return "Error Invalid Item"
+                Dim itemUnit = TableRows(item)(0)
+                itemUnit("stock") = ItemStock(location, itemRecID, itemUnit("unit").ToString)
+                Return Serialize(itemUnit)
+            End If
+
             Dim units = GetTable(" SELECT  SUnit_Unit [unit] ,
                                            ISNULL(( SELECT TOP 1 Bsy_Barcode
                                                     FROM   tbl_BarcodeSyn
@@ -503,18 +556,17 @@ Public Class DataService
 
     End Function
 
-    'The stock of the item in the active warehouses, shown in the unit (QtyDisplay), returns [{warehouse, qty, display}]
+    'The stock of the item in the warehouses, shown in the unit (QtyDisplay), returns [{warehouse, qty, display}]
     Private Function ItemStock(location As String, itemRecID As String, unit As String) As List(Of Dictionary(Of String, Object))
 
-        Dim stock = GetTable(" SELECT  CONVERT(VARCHAR(2), Wh_Code) [warehouse] ,
+        Dim stock = GetTable($" SELECT  CONVERT(VARCHAR(2), Wh_Code) [warehouse] ,
                                        ISNULL(Qty_AvlbQty, 0) [qty] ,
-                                       ISNULL(dbo.QtyDisplay(Qty_AvlbQty, @Unit, Stk_UnitCode, ISNULL(SUnit_PackingBasic, 1)), '') [display]
+                                       {QtyDisplaySql("@Unit")} [display]
                                FROM    tbl_Warehouses
                                        INNER JOIN tbl_StockItm ON Stk_Loc = Wh_Loc AND Stk_StkId = @ItemRecID
-                                       LEFT JOIN tbl_StockUnit ON SUnit_Loc = Stk_Loc AND SUnit_StkId = Stk_StkId AND SUnit_Unit = @Unit
+                                       {If(AppMultiUnit, "LEFT JOIN tbl_StockUnit ON SUnit_Loc = Stk_Loc AND SUnit_StkId = Stk_StkId AND SUnit_Unit = @Unit", "")}
                                        LEFT JOIN tbl_StockQty ON Qty_Loc = Stk_Loc AND Qty_Stkid = Stk_StkId AND Qty_WH = Wh_Code
                                WHERE   Wh_Loc = @Loc
-                                       AND ISNULL(Wh_Active, 'N') = 'Y'
                                ORDER BY Wh_Code ",
                              P("@Loc", location), P("@ItemRecID", ToRecID(itemRecID)), P("@Unit", unit))
 
@@ -581,7 +633,7 @@ Public Class DataService
 
             Dim location = AppLocation
             If String.IsNullOrWhiteSpace(location) Then Return "Error Location Is Not Configured"
-            Dim userCode = AppUserCode
+            Dim userCode = FitUserStamp(RequestUserCode)
             If String.IsNullOrWhiteSpace(userCode) Then Return "Error User Code Is Not Configured"
 
             saveMode = If(saveMode, "").Trim.ToUpper
@@ -600,7 +652,8 @@ Public Class DataService
                 If saveMode <> "D" Then
                     For Each line In returnLines
                         If line.state <> "D" AndAlso line.qtyReturn <= 0 Then Return "Error Quantity To Return Must Be Greater Than 0"
-                        If String.IsNullOrWhiteSpace(line.unit) OrElse String.IsNullOrWhiteSpace(line.warehouse) Then Return "Error Exist Invalid Records"
+                        'Without the units (MultiUnit 0) the item may have no unit
+                        If (AppMultiUnit AndAlso String.IsNullOrWhiteSpace(line.unit)) OrElse String.IsNullOrWhiteSpace(line.warehouse) Then Return "Error Exist Invalid Records"
                     Next
                 End If
 
@@ -817,20 +870,22 @@ Public Class DataService
     End Function
 
     'The lines to save (CreateTempTable / BulkInsertToTempDetails), a temp table of the connection : the devices share the same user
+    'The text columns have the collation of the database (COLLATE DATABASE_DEFAULT) : a temp table takes the collation of tempdb
+    '(the server), the joins with the tables of the database fail when the server and the database have different collations
     Private Sub CreateTempReturns(cmSQL As SqlCommand, trnSQL As SqlTransaction, location As String, supplierCode As String, saveMode As String, returnLines As List(Of ReturnLine))
 
         cmSQL.Parameters.Clear()
         cmSQL.CommandText = " CREATE TABLE #TempReturns (
-                                    [Loc] VARCHAR(2),
-                                    [Supplier] VARCHAR(4),
+                                    [Loc] VARCHAR(2) COLLATE DATABASE_DEFAULT,
+                                    [Supplier] VARCHAR(4) COLLATE DATABASE_DEFAULT,
                                     [ItemRecID] NUMERIC(18, 0),
-                                    [Unit] VARCHAR(3),
+                                    [Unit] VARCHAR(6) COLLATE DATABASE_DEFAULT,
                                     [QtyReturn] NUMERIC(8, 2),
                                     [OldQtyReturn] NUMERIC(8, 2),
                                     [WhouseNb] NUMERIC(2, 0),
-                                    [Remarks] NVARCHAR(500),
+                                    [Remarks] NVARCHAR(500) COLLATE DATABASE_DEFAULT,
                                     [Counter] NUMERIC(18, 0),
-                                    [State] VARCHAR(1)); "
+                                    [State] VARCHAR(1) COLLATE DATABASE_DEFAULT); "
         cmSQL.ExecuteNonQuery()
 
         Using dtReturns As New DataTable
@@ -871,10 +926,11 @@ Public Class DataService
 
     End Sub
 
+    'Without the units (MultiUnit 0) the returns have no unit (Sr_StkUnit)
     Private Sub InsertSupplierReturns(cmSQL As SqlCommand, location As String, supplierCode As String, userCode As String)
 
-        cmSQL.CommandText = " INSERT INTO tbl_SupplierReturns
-                                     ( Sr_Loc , Sr_Supplier , Sr_StkId , Sr_Counter , Sr_Date , Sr_QtyReturn , Sr_Whouse , Sr_Remarks , Sr_ContrRef , Sr_Ustmp , Sr_Dstmp , Sr_StkUnit )
+        cmSQL.CommandText = $" INSERT INTO tbl_SupplierReturns
+                                     ( Sr_Loc , Sr_Supplier , Sr_StkId , Sr_Counter , Sr_Date , Sr_QtyReturn , Sr_Whouse , Sr_Remarks , Sr_ContrRef , Sr_Ustmp , Sr_Dstmp {If(AppMultiUnit, ", Sr_StkUnit", "")} )
                               SELECT  @Loc ,
                                       @Supplier ,
                                       tr.ItemRecID ,
@@ -889,8 +945,8 @@ Public Class DataService
                                       NULLIF(tr.Remarks, '') ,
                                       NULL ,
                                       @UserCode ,
-                                      GETDATE() ,
-                                      tr.Unit
+                                      GETDATE()
+                                      {If(AppMultiUnit, ", tr.Unit", "")}
                               FROM    #TempReturns tr; "
 
         cmSQL.Parameters.Clear()
@@ -936,10 +992,18 @@ Public Class DataService
 
     'StockQtyTrx.UpdateStockQty for the returns : the returned quantity (in the basic unit) of the item (Stk_Return1) and of its warehouse (Qty_Return)
     'A : + the quantity, M : - (old quantity - quantity), D : - the quantity
+    'Without the units (MultiUnit 0) the quantity is in the unit of the item
     Private Sub UpdateStockQty(cmSQL As SqlCommand, location As String, userCode As String)
 
-        cmSQL.CommandText = " DECLARE @TempStockQtyChanges TABLE
-                                  ( LocationCode VARCHAR(2) ,
+        Dim packingBasicSql = If(AppMultiUnit, "SUnit_PackingBasic", "1")
+        Dim unitJoin = If(AppMultiUnit, " INNER JOIN ( SELECT SUnit_StkId , SUnit_Unit , SUnit_PackingBasic
+                                                           FROM   tbl_StockUnit
+                                                           WHERE  SUnit_Loc = @Loc
+                                                         ) tbl_StockUnit ON SUnit_StkId = ItemRecID
+                                                                            AND SUnit_Unit = Unit ", "")
+
+        cmSQL.CommandText = $" DECLARE @TempStockQtyChanges TABLE
+                                  ( LocationCode VARCHAR(2) COLLATE DATABASE_DEFAULT ,
                                     WarehouseCode NUMERIC(2, 0) ,
                                     ItemRecID NUMERIC(18, 0) ,
                                     QtyReturn NUMERIC(18, 2) );
@@ -952,13 +1016,9 @@ Public Class DataService
                                                    WHEN [State] = 'M' THEN -( ISNULL(OldQtyReturn, 0) - ISNULL(QtyReturn, 0) )
                                                    WHEN [State] = 'A' THEN ISNULL(QtyReturn, 0)
                                                    ELSE 0
-                                              END * SUnit_PackingBasic QtyReturn
+                                              END * {packingBasicSql} QtyReturn
                                       FROM    #TempReturns TempDetails
-                                              INNER JOIN ( SELECT SUnit_StkId , SUnit_Unit , SUnit_PackingBasic
-                                                           FROM   tbl_StockUnit
-                                                           WHERE  SUnit_Loc = @Loc
-                                                         ) tbl_StockUnit ON SUnit_StkId = ItemRecID
-                                                                            AND SUnit_Unit = Unit;
+                                              {unitJoin};
 
                               UPDATE  tbl_StockItm
                               SET     Stk_Return1 = ISNULL(Stk_Return1, 0) + ISNULL(SumQtyReturn, 0)
@@ -1028,6 +1088,19 @@ Public Class DataService
 
         Return dtData
 
+    End Function
+
+    'The user code cut to the size of the user stamp columns (Sr_Ustmp, Qty_UStmp) : a long device name does not stop the save
+    Private Function FitUserStamp(userCode As String) As String
+        Dim lengths = GetTable(" SELECT  CHARACTER_MAXIMUM_LENGTH [length]
+                                 FROM    INFORMATION_SCHEMA.COLUMNS
+                                 WHERE   ( TABLE_NAME = 'tbl_SupplierReturns' AND COLUMN_NAME = 'Sr_Ustmp' )
+                                         OR ( TABLE_NAME = 'tbl_StockQty' AND COLUMN_NAME = 'Qty_UStmp' ) ")
+        For Each row As DataRow In lengths.Rows
+            Dim length = If(IsDBNull(row("length")), -1, CInt(row("length")))
+            If length > 0 AndAlso userCode.Length > length Then userCode = userCode.Substring(0, length)
+        Next
+        Return userCode
     End Function
 
     Private Function P(name As String, value As Object) As SqlParameter
